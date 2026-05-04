@@ -8,6 +8,7 @@
 typedef struct {
     int   port;
     char  db_path[256];
+    const char *log_path;
 } ServerConfig;
 
 int server_run(const ServerConfig *cfg);

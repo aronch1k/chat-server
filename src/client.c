@@ -1,5 +1,7 @@
 #include "client.h"
 #include "protocol.h"
+#include "log.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,16 +14,20 @@ void client_list_add(ClientNode **head, pthread_mutex_t *mtx,
                      ClientContext *ctx) {
     ClientNode *node = malloc(sizeof(ClientNode));
     node->ctx  = ctx;
+
     pthread_mutex_lock(mtx);
     node->next = *head;
     *head      = node;
     pthread_mutex_unlock(mtx);
+
+    log_event(LOG_INFO, "Client added to list (fd=%d)", ctx->fd);
 }
 
 void client_list_remove(ClientNode **head, pthread_mutex_t *mtx,
                         ClientContext *ctx) {
     pthread_mutex_lock(mtx);
     ClientNode **cur = head;
+
     while (*cur) {
         if ((*cur)->ctx == ctx) {
             ClientNode *tmp = *cur;
@@ -31,7 +37,10 @@ void client_list_remove(ClientNode **head, pthread_mutex_t *mtx,
         }
         cur = &(*cur)->next;
     }
+
     pthread_mutex_unlock(mtx);
+
+    log_event(LOG_INFO, "Client removed from list (fd=%d)", ctx->fd);
 }
 
 /* ---------- broadcast ---------- */
@@ -39,14 +48,19 @@ void client_list_remove(ClientNode **head, pthread_mutex_t *mtx,
 void broadcast(ClientNode *list, pthread_mutex_t *mtx,
                const char *msg, int sender_fd) {
     pthread_mutex_lock(mtx);
+
     for (ClientNode *n = list; n; n = n->next) {
-        if (n->ctx->fd != sender_fd && n->ctx->authenticated)
+        if (n->ctx->fd != sender_fd && n->ctx->authenticated) {
             send(n->ctx->fd, msg, strlen(msg), MSG_NOSIGNAL);
+        }
     }
+
     pthread_mutex_unlock(mtx);
+
+    log_event(LOG_INFO, "Broadcast message from fd=%d", sender_fd);
 }
 
-/* ---------- вспомогательная: отправка пакета клиенту ---------- */
+/* ---------- send packet ---------- */
 
 static void send_pkt(int fd, const char *cmd,
                      const char *a1, const char *a2) {
@@ -55,137 +69,115 @@ static void send_pkt(int fd, const char *cmd,
     send(fd, buf, strlen(buf), MSG_NOSIGNAL);
 }
 
-/* ---------- callback для истории ---------- */
+/* ---------- история ---------- */
 
 typedef struct { int fd; } HistoryCbData;
 
 static void history_cb(const char *username,
-                        const char *message,
-                        void *userdata) {
-    HistoryCbData *d = (HistoryCbData *)userdata;
+                       const char *message,
+                       void *userdata) {
+    HistoryCbData *d = userdata;
     send_pkt(d->fd, RESP_HISTORY, username, message);
 }
 
-/* ---------- главный поток клиента ---------- */
+/* ---------- поток клиента ---------- */
 
 void *client_thread(void *arg) {
-    ClientContext *ctx = (ClientContext *)arg;
+    ClientContext *ctx = arg;
     char buf[MAX_PKT_LEN];
     Packet pkt;
 
-    /* Приветствие */
+    log_event(LOG_INFO, "Client thread started (fd=%d)", ctx->fd);
+
     send_pkt(ctx->fd, RESP_INFO, "Welcome! Use REGISTER or LOGIN.", NULL);
 
     while (1) {
         ssize_t n = recv(ctx->fd, buf, sizeof(buf) - 1, 0);
-        if (n <= 0) break; /* клиент отключился */
+        if (n <= 0) break;
+
         buf[n] = '\0';
 
         if (parse_packet(buf, &pkt) != 0) {
+            log_event(LOG_WARN, "Bad packet from fd=%d", ctx->fd);
             send_pkt(ctx->fd, RESP_ERROR, "Bad packet format", NULL);
             continue;
         }
 
-        /* REGISTER|username|password */
+        /* REGISTER */
         if (strcmp(pkt.command, CMD_REGISTER) == 0) {
-            if (ctx->authenticated) {
-                send_pkt(ctx->fd, RESP_ERROR, "Already logged in", NULL);
-                continue;
-            }
             int rc = db_register_user(ctx->db, pkt.arg1, pkt.arg2);
+
             if (rc == 0) {
-                send_pkt(ctx->fd, RESP_OK, "Registered. Now LOGIN.", NULL);
-            } else if (rc == -1) {
-                send_pkt(ctx->fd, RESP_ERROR, "Username taken", NULL);
+                log_event(LOG_INFO, "User registered: %s", pkt.arg1);
+                send_pkt(ctx->fd, RESP_OK, "Registered", NULL);
             } else {
-                send_pkt(ctx->fd, RESP_ERROR, "DB error", NULL);
+                log_event(LOG_WARN, "Register failed: %s", pkt.arg1);
+                send_pkt(ctx->fd, RESP_ERROR, "Register failed", NULL);
             }
         }
 
-        /* LOGIN|username|password */
+        /* LOGIN */
         else if (strcmp(pkt.command, CMD_LOGIN) == 0) {
-            if (ctx->authenticated) {
-                send_pkt(ctx->fd, RESP_ERROR, "Already logged in", NULL);
-                continue;
-            }
             if (db_login_user(ctx->db, pkt.arg1, pkt.arg2) == 0) {
                 strncpy(ctx->username, pkt.arg1, sizeof(ctx->username)-1);
                 ctx->authenticated = 1;
+
+                log_event(LOG_INFO, "User logged in: %s", ctx->username);
+
                 send_pkt(ctx->fd, RESP_OK, "Logged in", NULL);
 
-                /* Отправляем историю последних 20 сообщений */
                 HistoryCbData hd = { ctx->fd };
                 db_get_history(ctx->db, 20, history_cb, &hd);
 
-
-
-                /* Уведомить всех */
-                char notice[128];
-                snprintf(notice, sizeof(notice),
-                         "%s joined the chat.", ctx->username);
-                char pktbuf[MAX_PKT_LEN];
-                build_packet(pktbuf, sizeof(pktbuf),
-                             RESP_INFO, notice, NULL);
-                broadcast(*ctx->client_list, ctx->list_mutex,
-                          pktbuf, ctx->fd);
             } else {
+                log_event(LOG_WARN, "Login failed: %s", pkt.arg1);
                 send_pkt(ctx->fd, RESP_ERROR, "Wrong credentials", NULL);
             }
         }
 
-        /* MSG||text */
+        /* MESSAGE */
         else if (strcmp(pkt.command, CMD_MSG) == 0) {
-            if (!ctx->authenticated) {
-                send_pkt(ctx->fd, RESP_ERROR, "Not logged in", NULL);
-                continue;
-            }
-            if (strlen(pkt.arg1) == 0) {
-                send_pkt(ctx->fd, RESP_ERROR, "Empty message", NULL);
-                continue;
-            }
+            if (!ctx->authenticated) continue;
+
             db_save_message(ctx->db, ctx->username, pkt.arg1);
 
-            /* Разослать всем включая отправителя */
+
+            log_event(LOG_INFO, "Message from %s (%zu bytes)",
+                      ctx->username, strlen(pkt.arg1));
+
             char pktbuf[MAX_PKT_LEN];
             build_packet(pktbuf, sizeof(pktbuf),
                          RESP_MSG, ctx->username, pkt.arg1);
+
             send(ctx->fd, pktbuf, strlen(pktbuf), MSG_NOSIGNAL);
             broadcast(*ctx->client_list, ctx->list_mutex,
                       pktbuf, ctx->fd);
         }
 
-        /* HISTORY — повторная выдача */
+        /* HISTORY */
         else if (strcmp(pkt.command, CMD_HISTORY) == 0) {
-            if (!ctx->authenticated) {
-                send_pkt(ctx->fd, RESP_ERROR, "Not logged in", NULL);
-                continue;
-            }
             HistoryCbData hd = { ctx->fd };
             db_get_history(ctx->db, 50, history_cb, &hd);
+
+            log_event(LOG_INFO, "History requested by %s", ctx->username);
         }
 
         /* QUIT */
         else if (strcmp(pkt.command, CMD_QUIT) == 0) {
+            log_event(LOG_INFO, "Client requested quit (%s)", ctx->username);
             break;
-        }
-
-        else {
-            send_pkt(ctx->fd, RESP_ERROR, "Unknown command", NULL);
         }
     }
 
-    /* Отключение */
     if (ctx->authenticated) {
-        char notice[128];
-        snprintf(notice, sizeof(notice), "%s left the chat.", ctx->username);
-        char pktbuf[MAX_PKT_LEN];
-        build_packet(pktbuf, sizeof(pktbuf), RESP_INFO, notice, NULL);
-        broadcast(*ctx->client_list, ctx->list_mutex, pktbuf, ctx->fd);
+        log_event(LOG_INFO, "Client disconnected: %s", ctx->username);
+    } else {
+        log_event(LOG_INFO, "Client disconnected (unauthenticated, fd=%d)", ctx->fd);
     }
 
     client_list_remove(ctx->client_list, ctx->list_mutex, ctx);
     close(ctx->fd);
     free(ctx);
-    printf("[server] client disconnected.\n");
+
     return NULL;
 }
